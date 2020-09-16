@@ -1,0 +1,224 @@
+每个Token都会经过Indexing Chain(DefaultIndexingChain)的处理，这个链其实是TermsHash的链，另外还包含一个StoredFieldsConsumer，根据Segment是否需要排序分为两种链：
+
+- 有序链
+
+  **FreqProxTermsWriter** -> **SortingTermVectorsConsumer**
+
+  StoredFieldsConsumer[**SortingTermVectorsConsumer**]
+
+- 无序链
+
+  **FreqProxTermsWriter** -> **TermVectorsConsumer**
+
+  StoredFieldsConsumer[**TermVectorsConsumer**]
+
+
+
+# Codec
+
+Lucene中的Codec接口定义了存储数据的格式，可以通过JDK的ServiceLoader进行注册，然后通过名称被引用。
+
+可以通过实现Codec中的接口返回如下数据格式：
+
+- PostingsFormat
+- DocValuesFormat
+- StoredFieldsFormat
+- TermVectorsFormat
+- FieldInfosFormat
+- SegmentInfoFormat
+- NormsFormat
+- LiveDocsFormat
+- CompoundFormat
+- PointsFormat
+
+所有这些Format都是对某类数据进行序列化与反序列化，以便通过磁盘文件进行读写。
+
+
+
+# Stored Fileds Format
+
+用于存储文档内容，采用两种可选的压缩算法：**LZ4**和**DEFLATE**，前者注重速度（BEST_SPEED），后者注重压缩率（BEST_COMPRESSION）。
+
+内容分三个文件存储：
+
+1. 数据文件（.fdt）
+
+   存储按block压缩的文档数据。
+
+2. 索引文件（.fdx）
+
+   存储两个数组，一个指示每个block的首个doc ID，另一个存储block的文件偏移量
+
+3. 元数据文件（.fdm）
+
+   保存与索引文件中数组相关的元数据信息。
+
+
+
+`StoredFieldsWriter`接口用于存储文档的字段数据，其工作流程为：
+
+```java
+for(Document doc : documents)
+    startDocument()  //表示一个新文档的开始
+    for(Field field : doc.fields)
+        writeField(fieldInfo, indexableField) //写入每个字段的信息
+    finishDocument() //表示一个文档写入完成
+
+finish(FieldInfos, numDocs) //文档写入完毕
+close() //关闭相关的资源
+```
+
+
+
+## fdt
+
+### 文件头
+
+| 名称                | 内容                                                      | 大小(bytes) |
+| ------------------- | --------------------------------------------------------- | ----------- |
+| codec_magic         | 0x3fd76c17                                                | 4           |
+| codecLength         | length(codec) = 28                                        | 1（VInt）   |
+| codec               | Lucene87StoredFieldsFastData/Lucene87StoredFieldsHighData | 28          |
+| version             | 3                                                         | 4           |
+| segmentID           |                                                           | 16          |
+| segmentSuffixLength |                                                           | 1           |
+| segmentSuffix       |                                                           | [0, 255]    |
+
+
+
+### 数据块（Chunck）
+
+文件头之后是Document的数据信息，其被组织为Chunck进行存储，每个Chunck包含若干个Document，Document的信息会先被缓存到内存中，如果缓存中保存的Document个数或者缓存的总字节数超过设置的阈值，则会将当前缓存的文档信息打包为一个Chunck存储到fdt文件中。
+
+其中每个Chunck的结构为
+
+| 名称                 | 描述                                                         | 类型   |
+| -------------------- | ------------------------------------------------------------ | ------ |
+| docBase              | 块中第一个文档的ID（实际就是当前块之前已写入的文档数）       | VInt   |
+| numDocs \| slicedBit | numDocs是当前块中的文档数，其向左移了一位用于存储slicedBit，slicedBit标识此块是否被切割 | VInt   |
+| numStoredFields      | 长度等于numDocs的数组，其保存每个文档中的字段数              | VInt[] |
+| lengths              | 长度等于numDocs的数组，其保存每个文档的字节大小（未压缩的大小） | VInt[] |
+| data                 | Chunck的数据内容（压缩后）                                   | byte[] |
+
+当缓存的数据量大于两倍设置的chuncksize时，数据会被切片（slice），然后对每个slice进行压缩并存储，所以表格中的slicedBit就是用于指示块中的数据是否被划分为slice。
+
+其中data解压后的格式为：
+
+| 字段        | 描述                             | 类型  |
+| ----------- | -------------------------------- | ----- |
+| infoAndBits | fieldNumber << TYPE_BITS \| bits | VLong |
+| fieldValue  | 根据字段的类型存储对应的数据     |       |
+
+其中字段类型可以为：
+
+```java
+static final int         STRING = 0x00;
+static final int       BYTE_ARR = 0x01;
+static final int    NUMERIC_INT = 0x02;
+static final int  NUMERIC_FLOAT = 0x03;
+static final int   NUMERIC_LONG = 0x04;
+static final int NUMERIC_DOUBLE = 0x05;
+```
+
+fieldValue的存储格式：
+
+**ByteArray**
+
+| 字段   | 描述         | 类型   |
+| ------ | ------------ | ------ |
+| length | 字节数组长度 | VInt   |
+| bytes  | 字节数组内容 | Byte[] |
+
+**String**
+
+| 字段   | 描述                      | 类型   |
+| ------ | ------------------------- | ------ |
+| length | 字符串长度（UTF-8）       | VInt   |
+| bytes  | 字符串的字节表示（UTF-8） | Byte[] |
+
+**Byte**/**Short**/**Integer**
+
+| 字段   | 描述 | 类型 |
+| ------ | ---- | ---- |
+| number | 数值 | VInt |
+
+**Long**
+
+| 字段      | 描述                           | 类型  |
+| --------- | ------------------------------ | ----- |
+| header    | 如果是时间戳字段，标记时间粒度 | Byte  |
+| upperBits | long的zigzag编码字节           | VLong |
+
+Long字段写入前会先做timestamp的判断（目的是做压缩处理），判断的结果用header的前两个位表示：
+
+- 00 - 表示无需压缩
+- 01 - 表示值为1000的倍数（也就是说可以看作是粒度为秒的时间戳）
+- 10 - 表示值为3600000的倍数（粒度为小时的时间戳）
+- 11 - 表示值为86400000的倍数（粒度为天的时间戳）
+
+header剩下的6位用于存储long的部分数据，所以第三位表示之后是否有有效数据（和VInt原理一样），然后剩下的5位存储long数据的低5位，long的其它位通过VLong的形式存储于上述表格中的upperBits字段中。
+
+参考：*org.apache.lucene.codecs.compressing.CompressingStoredFieldsWriter.writeTLong(DataOutput out, long l)*
+
+**Float**
+
+| 字段   | 描述                 | 类型   |
+| ------ | -------------------- | ------ |
+| header | 决定存储字节数的标记 | Byte   |
+| bytes  | 存储float数据的字节  | Byte[] |
+
+参考：*org.apache.lucene.codecs.compressing.CompressingStoredFieldsWriter.writeZFloat(DataOutput out, float f)*
+
+**Double**
+
+| 字段   | 描述                 | 类型   |
+| ------ | -------------------- | ------ |
+| header | 决定存储字节数的标记 | Byte   |
+| bytes  | 存储Double数据的字节 | Byte[] |
+
+参考：*org.apache.lucene.codecs.compressing.CompressingStoredFieldsWriter.writeZDouble(DataOutput out, double d)*
+
+
+
+### 文件尾
+
+| 名称         | 内容                             | 大小(bytes) |
+| ------------ | -------------------------------- | ----------- |
+| footer_magic |                                  | 4           |
+| 固定常量     | 0                                | 4           |
+| CRC          | 文件中除文件尾之外的内容的校验码 | 8           |
+
+
+
+## fdx
+
+### 文件头
+
+| 名称                | 内容                   | 大小(bytes) |
+| ------------------- | ---------------------- | ----------- |
+| codec_magic         | 0x3fd76c17             | 4           |
+| codecLength         | length(codec) = 22     | 1（VInt）   |
+| codec               | Lucene85FieldsIndexIdx | 22          |
+| version             | 0                      | 4           |
+| segmentID           |                        | 16          |
+| segmentSuffixLength |                        | 1           |
+| segmentSuffix       |                        | [0, 255]    |
+
+
+
+## fdm
+
+### 文件头
+
+| 名称                | 内容                    | 大小(bytes)    |
+| ------------------- | ----------------------- | -------------- |
+| codec_magic         | 0x3fd76c17              | 4              |
+| codecLength         | length(codec) = 23      | 1（VInt）      |
+| codec               | Lucene85FieldsIndexMeta | 23             |
+| version             | 3                       | 4              |
+| segmentID           |                         | 16             |
+| segmentSuffixLength |                         | 1              |
+| segmentSuffix       |                         | [0, 255]       |
+| chunkSize           |                         | [1, 5]（VInt） |
+| PackedIntsVersion   | 2                       | 1（VInt）      |
+
