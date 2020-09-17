@@ -88,7 +88,7 @@ close() //关闭相关的资源
 
 ### 数据块（Chunck）
 
-文件头之后是Document的数据信息，其被组织为Chunck进行存储，每个Chunck包含若干个Document，Document的信息会先被缓存到内存中，如果缓存中保存的Document个数或者缓存的总字节数超过设置的阈值，则会将当前缓存的文档信息打包为一个Chunck存储到fdt文件中。
+文件头之后是Document的数据信息，其被组织为Chunck进行存储，每个Chunck包含若干个Document，Document的信息会先被缓存到内存中，如果缓存中保存的Document个数（默认chunck中最大文档数为512）或者缓存的总字节数超过设置的阈值，则会将当前缓存的文档信息打包为一个Chunck存储到fdt文件中。
 
 其中每个Chunck的结构为
 
@@ -184,13 +184,29 @@ header剩下的6位用于存储long的部分数据，所以第三位表示之后
 
 | 名称         | 内容                             | 大小(bytes) |
 | ------------ | -------------------------------- | ----------- |
-| footer_magic |                                  | 4           |
+| footer_magic | ~CODEC_MAGIC                     | 4           |
 | 固定常量     | 0                                | 4           |
 | CRC          | 文件中除文件尾之外的内容的校验码 | 8           |
 
 
 
 ## fdx
+
+fdx文件保存查找fdt文件中数据的索引信息。文档写入过程中并没有直接写fdx文件，而是先写入两个临时文件（非完整文件名）：
+
+- Lucene85FieldsIndex-doc_ids
+
+  保存fdt中每个chunck中的文档数
+
+- Lucene85FieldsIndexfile_pointers
+
+  保存fdt中每个chunck相对于前一个chunck的文件偏移量（也就是前一个chunck占用文件空间的大小）
+
+这两个临时文件除了数据内容外，拥有与fdt格式相同的文件头和文件尾，这里不再赘述。当一个segment写入完毕后，fdx的数据内容才会根据这两个临时文件的内容生成并写入fdx文件中。
+
+
+
+以下为fdx的文件格式
 
 ### 文件头
 
@@ -203,6 +219,26 @@ header剩下的6位用于存储long的部分数据，所以第三位表示之后
 | segmentID           |                        | 16          |
 | segmentSuffixLength |                        | 1           |
 | segmentSuffix       |                        | [0, 255]    |
+
+
+
+### 索引数据
+
+| 字段 | 描述 | 类型 |
+| ---- | ---- | ---- |
+|      |      |      |
+|      |      |      |
+|      |      |      |
+
+
+
+### 文件尾
+
+| 名称         | 内容                             | 大小(bytes) |
+| ------------ | -------------------------------- | ----------- |
+| footer_magic | ~CODEC_MAGIC                     | 4           |
+| 固定常量     | 0                                | 4           |
+| CRC          | 文件中除文件尾之外的内容的校验码 | 8           |
 
 
 
@@ -222,3 +258,34 @@ header剩下的6位用于存储long的部分数据，所以第三位表示之后
 | chunkSize           |                         | [1, 5]（VInt） |
 | PackedIntsVersion   | 2                       | 1（VInt）      |
 
+
+
+### 元数据信息
+
+| 字段                 | 描述                                                         | 类型  |
+| -------------------- | ------------------------------------------------------------ | ----- |
+| numDocs              | fdt文件中保存文档的总数                                      | Int   |
+| blockShift           | fdx文件中存储索引数据的block的大小（2的blockShift次方）。范围[2, 22]，默认为10 | Int   |
+| totalChuncks + 1     | fdx中的索引数据里                                            | Int   |
+| fdxDocsOffset        | fdx文件中开始存储chunck文档数数据的文件偏移量                | Long  |
+| fdxFilePointerOffset | fdx文件中开始存储chunck文件偏移量数据的文件偏移量            | Long  |
+| fdxMaxPointerOffset  | fdx文件中开始存储文件尾的文件偏移量                          | Long  |
+| fdtMaxPointerOffset  | fdt文件中开始存储文件尾的文件偏移量                          | Long  |
+| numChuncks           | fdt文件中存储的chunck的总数                                  | VLong |
+| numDirtyChuncks      | fdt文件中存储的不完整（uncomplete）的chunck的总数            | VLong |
+
+说明：
+
+（1）
+
+（2）在没有到达设置的文档数或字节大小而生成Chunck，比如Segment的结束会强行把剩下没处理的文档生成一个Chunck，这种Chunck就是所谓的不完整的Chunck。
+
+
+
+### 文件尾
+
+| 名称         | 内容                             | 大小(bytes) |
+| ------------ | -------------------------------- | ----------- |
+| footer_magic | ~CODEC_MAGIC                     | 4           |
+| 固定常量     | 0                                | 4           |
+| CRC          | 文件中除文件尾之外的内容的校验码 | 8           |
