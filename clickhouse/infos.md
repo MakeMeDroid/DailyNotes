@@ -136,13 +136,89 @@ ClickHouse赠送了几个构建高效软件的建议：
 
 ## ClickHouse的副本管理
 
-副本以table为单位，拥有副本的table需要指定`ReplicatedMergeTree`引擎，然后使用zookeeper保存副本的状态信息，这类table在zookeeper上会有一个对应的路径，具有相同路径的table互为副本。
+副本有两种实现方式：
 
-一个副本组里的每个table都可以作为主节点，这意味着每个副本都可以作为数据写入的对象节点。然后这些节点之间通过异步的方式相互同步数据（直接拷贝磁盘文件），达到数据的一致性。
+- Replicated*MergeTree系列表
+- 分布式表
+
+分布式表也可以依赖Replicated系列表实现副本。
+
+
+
+### Replicated
+
+Replicated类型的表有如下几类：
+
+- ReplicatedMergeTree
+- ReplicatedSummingMergeTree
+- ReplicatedReplacingMergeTree
+- ReplicatedAggregatingMergeTree
+- ReplicatedCollapsingMergeTree
+- ReplicatedVersionedCollapsingMergeTree
+- ReplicatedGraphiteMergeTree
+
+副本以table为单位，对于Replicated系列的表需要使用zookeeper保存副本的状态信息，这类table在zookeeper上会有一个对应的路径，具有相同路径的table互为副本。如果没有Zookeeper配置，Replicated系列的表将会是只读状态。
+
+Zookeeper的配置方式如下：
+
+```xml
+<zookeeper>
+    <node index="1">
+        <host>example1</host>
+        <port>2181</port>
+    </node>
+    <node index="2">
+        <host>example2</host>
+        <port>2181</port>
+    </node>
+    <node index="3">
+        <host>example3</host>
+        <port>2181</port>
+    </node>
+</zookeeper>
+```
+
+
+
+通过INSERT语句向表里写入数据时，数据被组织为一系列的block，每个block最多包含max_insert_block_size（默认1048576）行。每个block的写入会向Zookeeper中写入大概10个数据信息。所以向Replicated表中写入数据的延迟比非Replicated表要略微高一些。所以文档中建议通过批量的方式写入数据，并且每秒不要超过一次INSERT（这里不是太懂？！）。每个block的写入具有原子性。并且ClickHouse自带避免重复写入的机制，也就是说，如果连续写入相同的block（具有相同数据的block，大小，顺序，内容都要一致），只有一个会写入成功。
+
+一个副本组里的每个table都可以作为主节点，这意味着每个副本都可以作为数据写入的对象节点。然后这些节点之间通过异步的方式相互同步数据（只同步插入的原始数据），达到数据的一致性。
+
+
+
+Replicated系列引擎都有三个参数：
+
+- **zookeeper_path**
+
+  表在Zookeeper上的路径，互为副本的表有相同的路径。
+
+- **replica_name**
+
+  一个副本组内的每个副本有一个自己的replica_name，用于区分这些副本。
+
+- **other_parameters**
+
+  用于特殊类型引擎的参数，比如ReplacingMergeTree的version参数。
+
+
+
+### 分布式表副本
+
+分布式表依赖集群，集群中又可以设置副本。分布式表中的副本只是个声明，这些副本既可以对应Replicated类型的表，也可以对应普通的MergeTree表，这种对应关系会决定数据怎么写入到表中。对于Replicated的表，数据会在副本表之间自动同步，因此副本的`internal_replication`的参数设置为true；对于普通MergeTree表，因为没有自动同步机制，所以要求分布式表自己负责对各个副本的写入工作，通过设置`internal_replication`为false表明这种情况。
 
 
 
 ## ClickHouse的多磁盘存储机制
+
+多磁盘存储的主要目的是为不同类型的数据提供不同的存储方案，实现存储空间的层级化（tiered storage），比如冷热数据分离。（这里的存储分离是面向单个ClickHouse节点，而非集群）
+
+此外，多磁盘存储可以有效的解决单机存储扩容的问题。
+
+这里引用一张别人制作的图说明多磁盘的逻辑概念及结构：
+
+![clickhouse_multi-device-storage](C:\Users\cyp\Desktop\Notes\clickhouse\clickhouse_multi-device-storage.jpg)
+
+从图中可以了解到，每个物理磁盘会对应文件系统中的一个mount point，多个磁盘组成一个volume，而多个volume又属于一个policy，每个表对应一个policy。
 
 参考：
 
@@ -407,3 +483,17 @@ SELECT uniqMerge(column1) FROM t GROUP BY ...
 - [`maxMap`](https://clickhouse.tech/docs/en/sql-reference/aggregate-functions/reference/maxmap/#agg_functions-maxmap)
 
 因为这种类型是直接存储聚合后的结果，所以其保存的值类型和原始字段的类型相同，这样写入和查询时就不再使用`-Merge`/`-State`函数。
+
+
+
+# Architecture
+
+代码实现中存在两类优化查询效率的方法：向量化执行（Vectorized query execution）和动态代码生成（Runtime code generation）。具体描述可参考：
+
+http://15721.courses.cs.cmu.edu/spring2016/papers/p5-sompolski.pdf
+
+
+
+表数据在内存中通过Block进行标识，每个Block包含3部分(IColumn, IDataType, column name)，其中IColumn保存表数据，IDataType表明数据类型，column name是相应的列名。Block中的数据是不可变的，对Block中的数据进行计算时只会增加和删除列。
+
+Block中只包含表数据的一部分，表的所有数据以Block流（IBlockInputStream和IBlockOutputStream）表示。每种类型的流可以对Block进行某种计算，其实原理和迭代器一样。流通过pull的方式获取Block，这种方式驱动着Block在不同的Stream类型之间流动，多个Stream组成一个流水线。
