@@ -14,6 +14,10 @@ Math.max(1, 64 - Long.numberOfLeadingZeros(maxNumber));
 
 PackedInt提供了两种方式来存储这些bit：**long数组**和**byte数组**。
 
+通常，写入数据用byte数组，而读取操作用long数组。
+
+
+
 ## long数组存储
 
 一个long可以存储64位，但bitsPerValue不一定能整除64，所以需要选择某个数量的long，使其正好能存储整数个bitsPerValue，long的数量在实现中记为`longBlockCount`，而这么多个long能存储的bitsPerValue的数量记为longValueCount，它们有如下关系：
@@ -191,10 +195,119 @@ DirectReader为每个bitsPerValue值创建一个`LongValues`的子类`DirectPack
 
 
 
+### Packed64、Packed64SingleBlock
+
+两个类都提供了对数据进行读写的操作，并且读写都有单值和批量两种方式。
+
+Packed64先把数据存储于long数组中，然后按packedInt的格式对数据进行读取，批量读写用到了BulkOperation类的功能。
+
+Packed64SingleBlock的功能和Packed64类似，区别是其解析数据是按照PACKED_SINGLE_BLOCK的方式进行的。
+
+
+
 ### PackedWriter
 
 接口`PackedInts.Writer`唯一的实现类，其写入数据的流程和`DirectWriter`基本一样，这个类中多了个写入文件头的函数，文件头中包含bitsPerValue和valueCount等信息。
 
 
 
-### BlockPackedWriter、BlockPackedReader
+### BlockPackedWriter、BlockPackedReader、BlockPackedReaderIterator
+
+BlockPackedWriter也是采用packedint的格式存储数字，存储方式如下：
+
+1. 将需要存储的数据分为一系列大小为blockSize的块（blockSize为2的整数次幂）
+2. 每个block的数据存储之前先确定数据中的最大值和最小值以及最大值与最小值之间的差值
+3. 在磁盘文件中先存储表示差值所需的bit个数以及用zigzag编码的最小值
+4. 最后存储原始数据与最小值的差值（如果所有数据相同，则这一步可以省略，因为这时候差值所需bit数为0）。
+
+
+
+BlockPackedReader把每个block解析为一个最小值和一个PackedInts.Reader类型的对象，并把它们保存到各自的数组中，然后根据index从Reader中读取数据。
+
+
+
+BlockPackedReaderIterator提供了一个迭代器用于读取BlockPackedWriter写入的数据，可以每次读取一个，或者是一次读取多个。这个迭代器没有实现Java中的Iterator接口，所以没有相应的hasNext()接口，而是提供了skip(long)，next(), next(count)等接口。
+
+
+
+### DirectMonotonicWriter、DirectMonotonicReader
+
+DirectMonotonicWriter用于保存单调递增的整数数列。
+
+写入的数据被划分为一系列block，因此对象创建时需要传入blockShift参数，每个block的包含的整数个数为
+$$
+2^{blockShift}
+$$
+
+存储n个数据就需要`((n - 1) >>> blockShift) + 1`个block。
+
+因为每个block中的数据都是单调递增的，所以这里采用了保存数据增量的方式存储数据，以有效压缩数据的存储大小。过程如下：
+
+1. 计算block中数据的平均增量。用最后一个数据与第一个数据的差值除以数据之间间隔数（也就是数据总数减1）。比如
+
+   ```
+   对于数组[2, 5, 6, 10]
+   数据个数为4，数据之间的间隔数为3（逗号的数量）
+   那么这个数组的平均增量为(10 - 2) / 3 = 2.667
+   ```
+
+   这个平均增量记为`AvgIncrement`。
+
+2. 计算每个数据相对于平均增量计算出的期望值的偏移量
+
+   ```
+   还是以上面的例子为例，计算得出AvgIncrement为2.667，这样数组中第i个位置的元素的期望值为(AvgIncrement * i)的取整，i从0开始；
+   因此数组用AvgIncrement计算出的期望值为：[0, 2, 5, 8];
+   然后数组中每个元素相对于期望值的偏移量为：[2, 3, 1, 2]
+   ```
+
+3. 找出步骤2中的最小偏移量。在上面的例子中为第三个偏移量：1。
+
+4. 计算出步骤2中每个偏移量减去最小偏移量的值，并找出最终的最大值（记为maxDelta）：
+
+   ```
+   在上面的例子中，最小的偏移量为1，因此，减去最小偏移量之后的结果为：
+   [2, 3, 1, 2] - 1 = [1, 2, 0, 1]
+   最终结果中，最大值maxDelta为2
+   ```
+
+5. 计算保存maxDelta所需的最大位数。如果步骤4中的maxDelta为0，说明block中的数据为等差数列，只需要在元数据文件中相应字段中存储0即可；如果maxDelta不为0，则需要在索引数据中存储步骤4的计算结果(也就是例子中的[1, 2 ,0, 1]数组)。
+
+
+
+整个过程设计到两个文件，一个用于保存元数据信息，另一个用于保存数据信息。元数据信息包括步骤3中获取的最小值、步骤1中的AvgIncrement、当前block的数据在数据文件中的偏移量以及存储maxDelta所需的位数。真实数据则通过[DirectWriter](#DirectWriter和DirectReader)写入数据文件。
+
+
+
+DirectMonotonicReader会先读取元数据文件的信息到内存，然后根据这些信息还原数据文件中的数据。除了通过index读取数据外，此类还提供了通过二分法在指定索引范围内查找某个值的方法。能进行二分查找的关键是对于一个给定的index，其可以根据元数据信息确定一个范围，因为元数据信息中记录了表示maxDelta的位数，所以delta的变化范围是[0, maxDelta]，通过delta也就可以确定真实数据的范围。
+
+
+
+### MonotonicBlockPackedWriter、MonotonicBlockPackedReader
+
+这两个类处理的也是单调递增的整数数列，写入的流程和DirectMonotonicWriter一模一样。
+
+想吐槽的一点是DirectMonotonicWriter写入流程中的步骤2和3在这个类中写在了一个for循环中，理解起来很是晦涩，不用公式推导一下真不知道到底在计算啥。接下来我们站在写这个代码的人的角度来考虑这段代码应该怎么写：
+
+首先，每个值相对于avg的偏移量是`(values[k] - avg * k)`,在所有这些偏移量中，肯定存在某个索引m使得其对应的偏移量`(values[m] - avg * m)`是其中的最小值，记为min；所以对于每个索引`i`，最终要保存的数值是`(values[i] - avg * i - min)`，并且这个值肯定是大于等于0的。因此代码中先假设这个min是`(values[0] - avg * 0)`，也即values[0]，然后根据这个最小值计算索引`i`上的期望值expected[i]为`(min + avg*i)`，如果这个值大于values[i]，说明这个min不是最小值，而应该以`(values[i] - avg * i)`取代原来的min，而`(values[i] - avg*i) <=> values[i] - (min + avg*i) + min <=> min - (expected[i] - values[i])`。这就是代码中计算min的表达式的由来，余下的部分和DirectMonotonicWriter中的处理就是一样的了。
+
+需要注意的是这个类保存数据只用到了一个文件，也就是元数据信息和数据是存在一起的，这种方式显然没有把元数据信息单独存储的方式灵活，因为元数据信息不能一次性读取到内存，所以二分查询也就难以实现。这就是为啥MonotonicBlockPackedReader只提供了按索引读取数据的方法。
+
+
+
+### PackedLongValues、DeltaPackedLongValues、MonotonicLongValues
+
+（待续）
+
+
+
+### GrowableWriter
+
+此类实现了`PackedInts.Mutable`接口，提供了读写整型数据的功能，内部存储用packedInt格式。它有一个初始bitsPerValue，当写入的值需要的位数大于初始的bitsPerValue时，会重新选择合适的bitsPerValue并重新构建之前的数据，这就是`Growable`的含义。
+
+
+
+### PackedDataInput、PackedDataOutput
+
+（待续）
+

@@ -1,5 +1,13 @@
 # Stored Fileds Format
 
+storedFieldsFormat用于存储文档的原始数据，大概的思想是把待存储的文档分为多个组，每组称为一个chunck，因此文档的数据就以chunck为单位进行压缩并保存到一个后缀名为fdt的文件中。同时对于每个chunck包含多少文档以及每个chunck在文件中的偏移量信息会保存到一个叫fdx的文件中，查找文档时作为索引使用。fdx保存的这两种数据都是单调递增的整数数列，所以保存它们的方式就采用PackedInt的DirectMonotonicWriter的实现，因此需要另一个文件fdm保存需要存储的元数据信息。
+
+所以这个format总共需要三个文件来完成数据的存储，详情如下所述。
+
+
+
+## 数据写入
+
 用于存储文档内容，采用两种可选的压缩算法：**LZ4**和**DEFLATE**，前者注重速度（BEST_SPEED），后者注重压缩率（BEST_COMPRESSION）。
 
 内容分三个文件存储：
@@ -67,10 +75,10 @@ close() //关闭相关的资源
 
 其中data解压后的格式为：
 
-| 字段        | 描述                             | 类型  |
-| ----------- | -------------------------------- | ----- |
-| infoAndBits | fieldNumber << TYPE_BITS \| bits | VLong |
-| fieldValue  | 根据字段的类型存储对应的数据     |       |
+| 字段        | 描述                                               | 类型  |
+| ----------- | -------------------------------------------------- | ----- |
+| infoAndBits | fieldNumber << TYPE_BITS \| bits（字段ID及类型ID） | VLong |
+| fieldValue  | 根据字段的类型存储对应的数据                       |       |
 
 其中字段类型可以为：
 
@@ -187,54 +195,16 @@ fdx文件保存查找fdt文件中数据的索引信息。文档写入过程中�
 
 ### 索引数据
 
-| 字段 | 描述 | 类型 |
-| ---- | ---- | ---- |
-|      |      |      |
-|      |      |      |
-|      |      |      |
+| 字段          | 描述                       | 类型 |
+| ------------- | -------------------------- | ---- |
+| chunckDocs    | chunck中的累计文档数       |      |
+| chunckOffsets | chunck在文件中的相对偏移量 |      |
 
 索引数据中保存两种数据：chunck中的文档数和chunck在fdt文件中的起始偏移量。
 
 两种数据是分开存储的，索引文件中先存储了文档数信息，然后存储偏移量信息。因为这两种数据都是long型数据，并且都是单调递增的数列，所以在索引文件中都采用相同的存储格式。
 
-数据被组织为block，每个block的大小为
-$$
-2^{blockShift}
-$$
-
-其中blockShift为fdm文件中记录的一个元数据信息，是写入数据前用户设置的一个参数。这样存储n个数据就需要`((n - 1) >>> blockShift) + 1`个block。
-
-因为每个block中的数据都是单调递增的，所以这里采用了保存数据增量的方式存储数据，以有效压缩数据的存储大小。过程如下：
-
-1. 计算block中数据的平均增量。用最后一个数据与第一个数据的差值除以数据之间间隔数（也就是数据总数减1）。比如
-
-   ```
-   对于数组[2, 5, 6, 10]
-   数据个数为4，数据之间的间隔数为3（逗号的数量）
-   那么这个数组的平均增量为(10 - 2) / 3 = 2.667
-   ```
-
-   这个平均增量记为`AvgIncrement`。
-
-2. 计算每个数据相对于平均增量计算出的期望值的偏移量
-
-   ```
-   还是以上面的例子为例，计算得出AvgIncrement为2.667，这样数组中第i个位置的元素的期望值为(AvgIncrement * i)的取整，i从0开始；
-   因此数组用AvgIncrement计算出的期望值为：[0, 2, 5, 8];
-   然后数组中每个元素现对于期望值的偏移量为：[2, 3, 1, 2]
-   ```
-
-3. 找出步骤2中的最小偏移量。在上面的例子中为第三个偏移量：1。
-
-4. 计算出计算出步骤2中每个偏移量减去最小偏移量的值，并找出最终的最大值（记为maxDelta）：
-
-   ```
-   在上面的例子中，最小的偏移量为1，因此，减去最小偏移量之后的结果为：
-   [2, 3, 1, 2] - 1 = [1, 2, 0, 1]
-   最终结果中，最大值maxDelta为2
-   ```
-
-5. 计算保存maxDelta数组所需的最大位数。如果步骤4中的maxDelta为0，说明block中的数据为等差数列，只需要在元数据文件中相应字段中存储0即可；如果maxDelta不为0，则需要在索引数据中存储步骤4的计算结果(也就是例子中的[1, 2 ,0, 1]数组)。
+参考[DirectMonotonicWriter](Utils/packed_ints.md#DirectMonotonicWriter、DirectMonotonicReader)
 
 
 
@@ -274,9 +244,9 @@ $$
 | blockShift           | fdx文件中存储索引数据的block的大小（2的blockShift次方）。范围[2, 22]，默认为10 | Int   |
 | totalChuncks + 1     | fdx中的索引数据里存储的数据数量                              | Int   |
 | fdxDocsOffset        | 每个chunck中包含多少个文档的信息在fdx文件中存储的起始偏移量  | Long  |
-| fdxDocsBlocks        | fdx中保存文档数数据的block的信息                             |       |
+| fdxDocsBlocks        | fdx中保存的每个chunck的累计文档数量的元数据信息（参考DirectMonotonicWriter） |       |
 | fdxFilePointerOffset | 每个chunck在fdt中的偏移量信息在fdx文件中存储的起始偏移量     | Long  |
-| fdxFilePointerBlocks | fdx中保存偏移量数据的block的信息                             |       |
+| fdxFilePointerBlocks | fdx中保存的每个chunck的偏移量数据的元数据信息（参考DirectMonotonicWriter） |       |
 | fdxMaxPointerOffset  | fdx文件中开始存储文件尾的文件偏移量                          | Long  |
 | fdtMaxPointerOffset  | fdt文件中开始存储文件尾的文件偏移量                          | Long  |
 | numChuncks           | fdt文件中存储的chunck的总数                                  | VLong |
@@ -308,3 +278,15 @@ $$
 | footer_magic | ~CODEC_MAGIC                     | 4           |
 | 固定常量     | 0                                | 4           |
 | CRC          | 文件中除文件尾之外的内容的校验码 | 8           |
+
+
+
+## 数据读取
+
+数据读取接口为`StoredFieldsReader`，其主要功能是通过docID获取文档的数据。
+
+首先根据fdm文件和fdx文件的内容构建索引，因为fdx中包含两个信息，一个是每个chunck的包含的文档ID的范围（也就是上面所说的每个chunck包含的文档数的累计值），另一个就是每个chunck在fdt文件中的偏移量。
+
+根据文档ID，可以根据索引中ID的范围信息通过二分查找法确定拥有此ID的文档所在的chunck的编号，然后根据这个编号又可以查找到索引中这个chunck在fdt文件中的偏移量。
+
+最后把此Chunck的数据读取到内存中，通过(docID - docBase)计算出文档在chunck中的序号，并根据chunck中保存的每个文档长度信息（未压缩的大小）计算出文档数据开始的偏移量，最终从解压后的chunck数据中读取文档的字段信息。
