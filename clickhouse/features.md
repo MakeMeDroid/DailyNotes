@@ -90,6 +90,8 @@ MergeTree系列的表引擎中包含几个有特殊功能的引擎：
 
 # 7、查询资源隔离
 
+没有相关特性
+
 
 
 # 8、存储效率
@@ -447,7 +449,7 @@ SETTINGS index_granularity = 8192
 
 # 9、副本支持
 
-参考《随机.md》中的ClickHouse的副本管理
+参考《infos.md》中的ClickHouse的副本管理
 
 
 
