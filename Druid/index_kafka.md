@@ -1,0 +1,105 @@
+## Supervisor
+
+`SeekableStreamSupervisor<PartitionIdType, SequenceOffsetType>`
+
+对类Kafka的数据源的处理抽象，每个Supervisor负责一个Stream（在Kafka中称为Topic），每个Stream会有多个partition，每个partition会有个对应的ID（通过PartitionIdType指定，在kafka中是一个整数），这些partition被分到不同的group中，一个partition对应一个group，一个group可以包含多个partition。这一个group称为TaskGroup，每个TaskGroup有一个ID
+
+
+
+任务开始之前，需要获取当前使用的topic中拥有的partition数量，并根据IoConfig中的`taskCount`值创建对应数量的taskGroup，每个group负责处理部分partition中的数据，partition到taskGroup的对应关系目前只有一种方式：`partition % taskCount`，结果值即为partition对应的taskGroupID。
+
+
+
+接下来创建`TaskGroup`，一个TaskGroup需要包含如下信息：
+
+- groupID
+- 能处理的数据的时间范围[minTime, maxTime]
+- group中管理的每个partition的开始偏移量
+
+其中groupID是一个位于[0, taskCount)的整数；
+
+数据的有效时间范围由IOConfig中的`lateMessageRejectionPeriod`，`earlyMessageRejectionPeriod`，`lateMessageRejectionStartDateTime`配置参数决定；
+
+每个partition的开始偏移量获取途径由如下几类：
+
+1. `partitionOffsets`字段中的记录信息
+
+   为了说明这个字段，引用了代码中的注释：partitionOffsets字段用于记录每个partition的读取偏移量，初始状态下，字段中所有的partition的偏移量都是未设置状态。当一个任务进入publishing状态后，字段中的偏移量信息会被更新为这个任务的结束偏移量，也就是下一个任务的开始偏移量。如果这个处于publishing状态的任务失败了，其在此字段中对应的partition的偏移量会被重置为未设置状态，这样新任务启动时可以通过mysql中的metadata信息获取偏移量信息。这种处理方式可以允许当一个任务处于publishing状态时就启动下一个任务，而不需等待上一个任务结束才启动新任务。
+
+2. mysql中`druid_datasource`表记录的metadata信息
+
+3. 从kafka集群获取partition的偏移量
+
+   当前两种方式都失败后，采用这种方式，根据IOConfig中的`useEarliestOffset`决定获取partition中最早的的偏移量（true）还是最新的偏移量（false）。
+
+
+
+TaskGroup中会维护若干个Task，task的个数由IoConfig中的`replicas`决定。一个taskGroup中所有的task消费相同的数据，因此supervisor需要维护这些副本之间的信息同步，也就是partition的offset。
+
+Supervisor会检测TaskGroup中维护的任务数是否到达了要求的副本数，如果没有达到，则为TaskGroup创建并提交缺失的任务。注意，这里只是提交任务，并没有向TaskGroup中添加任务信息。Supervisor只会在任务真正运行之后才会将其计入到taskGroup中，这是通过如下步骤保证的：
+
+1. 任务需要被添加到taskStorage中，任务被添加到TaskQueue之前都会先通过Mysql对任务进行记录，只要任务被记录到mysql中，任务总会在之后的某个时刻被调度执行（这是一种容错机制，防止任务提交后overload异常导致任务丢失，比如当前主节点宕机，新的主节点被选举的情况）。
+
+2. 从taskStorage中获取的任务需要能返回状态信息。taskStorage中保存的任务只能保证这个任务已经被提交到任务队列（TaskQueue）中，并不能保证任务已经在peon进程中执行了。正常启动并执行的任务会提供若干个http接口，其中就包含获取任务状态的接口（GET /status），所以supervisor采用访问状态接口来检测任务是否真正执行。如果在规定的时间内无法获取到任务的状态，则supervisor会认为此任务异常并以如下理由对其进行关闭：
+
+   **Task [<taskID>] failed to return status, killing task**
+
+   如果任务的状态能正常返回，说明任务已经开始正常运行了。
+
+需要明白，正常运行的任务不一定就是TaskGroup需要的task，因为taskGroup与Task之间至少得保证以下信息一致：
+
+- 任务中所有的partition对应的groupID必须相同，并且与taskGroup的ID一致
+
+- 任务的基本信息与TaskGroup的基本信息必须一致
+
+  基本信息指partition的开始偏移量，最大最小时间，DataSchema和TuningConfig，代码中通过将这些信息生成字符串进行比较。
+
+- 任务的IOConfig中的baseSequenceName必须与taskGroup中的其他任务的baseSequenceName一致，并且都等于taskGroup的baseSequenceName
+
+  每个TaskGroup都有自己的baseSequenceName，它是TaskGroup的唯一标识，taskGroup中的每个Task都应该拥有此标识，这个标识是task的ID的组成部分。
+
+如果这三个条件都满足，说明这个task确实是此TaskGroup的门徒，taskGroup可以安心收留它了。
+
+
+
+这里有个特殊情况，就是任务被发现时已经处于publishing状态了，此时会把任务直接放到pendingCompletionTaskGroups中，并且获取任务的endOffset，然后把有效的offset更新到partitionOffsets字段中，以供下一个任务获取开始偏移量。
+
+
+
+这里有个现象是，如果为taskGroup提交任务后的第一次discoverTasks过程中没有发现提交的任务，则supervisor会为taskGroup提交新的任务，当然，这中情况极少发生，supervisor的程序运行间隔最少为1秒，也即任务成功写入mysql的时间消耗超过了1秒。当出现这种现象时，taskGroup中维护的任务数会多于设置的replicas值，只不过这除了会浪费worker资源外，对数据没有任何影响。
+
+
+
+发现了TaskGroup提交的任务后，只会向TaskGroup中插入一个类型为TaskData的空对象，这个对象会记录三个信息：
+
+- 任务的开始时间
+- 任务的状态信息（RUNNING，SUCCESS或FAILED）
+- 任务中每个kafka分区的偏移量信息
+
+当任务发现的流程完成后，便会为新发现的任务更新TaskData信息，首先通过任务提供的http接口获取任务开始时间，然后再从mysql表中获取任务状态（表中的状态信息只会在提交任务和任务完成两个时机修改）。如果获取任务的开始时间失败，则任务会被视为异常，并被以如下理由kill：
+
+**Task [<taskID>] failed to return start time, killing task**
+
+对于pendingCompletionTaskGroups中任务的TaskData，每次都会从TaskStorage中获取状态并更新到TaskData。这是因为处于这个容器中的任务都是进入publishing状态，随时会结束，所有每次都得从TaskStorage中获取其状态，以备后续的步骤能及时处理已经结束的任务。
+
+
+
+TaskGroup中的任务有了，状态也更新了，接下来就得握紧手里的缰绳，不能让task肆意的狂奔，这根缰绳就是IoConfig中配置的`taskDuration`，默认情况下它是1小时。前面说到一个TaskGroup中可以有多个任务（它们互为副本），当它们其中的任何一个任务的运行时间超过了taskDuration时，这个taskGroup中的所有任务都会被要求结束。
+
+任务结束前最重要的事是确定数据的checkpoint，也即任务的终止偏移量。具体步骤是先让TaskGroup中的所有任务都处于pause状态，这样保证任务中的offset不会再发生变更，然后获取所有任务的当前偏移量，取其中最大的偏移量作为结束偏移量，然后把所有任务的endOffsets都设置为上一步获取的结束偏移量，这些任务运行到endOffsets时会自动结束。
+
+checkpoint设置完毕之后，TaskGroup便会被从activelyReadingTaskGroups中移除，并添加到pendingCompletionTaskGroups中，上一步骤确定的checkpoint也会更新到partitionOffsets中，以备下一个任务获取开始偏移量的信息。同时TaskGroup会开始时长为IoConfig里`completionTimeout`的倒计时，在时间耗尽之前TaskGroup里的任务必须全部结束，否则TaskGroup中的所有任务都会被强行kill。当一个处于pendingCompletion的TaskGroup被kill时，处于active状态中的相同groupid的任务也会被kill。
+
+
+
+除了上面所说的步骤，Supervisor会检测正常运行（active）的任务有没有结束（没有放入到pengingCompletion就结束的），如果失败则将其从TaskGroup中移除，如果成功结束则停止TaskGroup内的所有任务。这个步骤是一种容错机制，并不在正常的处理流程范围内。
+
+
+
+## TaskRunner
+
+根据Task中携带的partition偏移量信息从kafka中读取数据，并通过`Appenderator`进行写入。
+
+当写入过程中某个条件被触发时，任务会进行一次checkpoint，通过向supervisor发送一个checkpoint请求实现，而supervisor接下来执行的步骤与上一节中描述的supervisor的checkpoint的过程是一样的。如果把partition的数据看作一条线，则这条线会被若干个点分隔，这些点就是checkpoint，两个checkpoint之间的数据元数据信息由一个类型为`SequenceMetadata`的对象记录。每个SequenceMetadata有个唯一的sequenceName，`StreamAppenderatorDriver`通过sequenceName来管理segment，也即每个SequenceMetadata会创建并管理自己的segment。
+
+checkpoint只是确定了一个SequenceMetadata需要处理的数据范围（通过指定partition的结束偏移量）。如果某个SequenceMetadata中的数据都被处理完毕，任务会对这个SequenceMetadata中的segments执行publish和handoff流程。
